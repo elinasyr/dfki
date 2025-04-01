@@ -1,82 +1,107 @@
-import pandas as pd
-from sklearn.preprocessing import LabelEncoder
+import torch
+from utils import get_data
+from torch.utils.data import TensorDataset, DataLoader
+
+encoder_length, decoder_length, num_test_samples = 3, 3, 100
 
 
-def plan_from_trajectories(t, keep_only_order=False):
-    plan = []
-    prev_goal = None
+def create_sliding_windows(timeseries_list, encoder_history, forecast_horizon):
+    windowed_data = []  # Store extracted windows
 
-    for goal in t["goal_status"]:
-        if goal != prev_goal:
-            plan.append(goal)
-            prev_goal = goal
-    final_plan = list(dict.fromkeys(plan))
-    if keep_only_order:
-        plan_by_numbers = []
-        for stop in final_plan:
-            if stop[:6] == "moving":
-                plan_by_numbers.append(int(stop[-1]))
-        return plan_by_numbers
-    return final_plan
+    for series in timeseries_list:
+        series_length = len(series)
+        windows = []
 
+        for i in range(series_length - encoder_history - forecast_horizon + 1):
+            x = series[i : i + encoder_history]  # Input history
+            y = series[
+                i + encoder_history : i + encoder_history + forecast_horizon
+            ]  # Future values
+            windows.append((x, y))
 
-plan_mapping = {
-    "[1, 6, 4, 2, 3, 5]": 1,
-    "[3, 5, 4, 1, 6, 2]": 2,
-    "[5, 4, 6, 3, 1, 2]": 3,
-    "[2, 6, 1, 5, 4, 3]": 4,
-    "[6, 5, 2, 4, 1, 3]": 5,
-}
+        windowed_data.append(windows)
+
+    return windowed_data
 
 
-def get_data():
+data = get_data()
+number_of_goals = len(data["goal_status"].unique())
+data_lists = data.groupby("id")["goal_status"].agg(list).tolist()
 
-    data = pd.DataFrame()
-    valid_plans = [
-        1,
-        2,
-        3,
-        5,
-        6,
-        7,
-        8,
-        9,
-        10,
-        11,
-        12,
-        13,
-        14,
-        15,
-        16,
-        17,
-        18,
-        19,
-        20,
-        22,
-        25,
-        32,
-        35,
-        40,
-        55,
-    ]
-    for i in valid_plans:
-        temp = pd.read_csv(f"./output_robot5data/out{i}.csv")
-        temp = temp[["goal_status"]]  # 'idle'
-        temp.drop_duplicates(subset=["goal_status"], keep="first", inplace=True)
-        if temp.shape[0] < 10:
-            continue
-        plan = plan_from_trajectories(temp, keep_only_order=True)
-        if str(plan) not in list(plan_mapping.keys()):
-            continue
-        temp["id"] = i
-        temp["plan"] = plan_mapping[str(plan)]
-        if temp.iloc[-1].goal_status == "(unknown)":
-            temp = temp[:-1]
 
-        data = pd.concat([data, temp])
-    data.reset_index(drop=True, inplace=True)
-    enc = LabelEncoder()
+x = [torch.tensor(sample) for sample in data_lists]
 
-    data["goal_status"] = enc.fit_transform(data[["goal_status"]])
+x_windowed = create_sliding_windows(x, encoder_length, decoder_length)
+source, target = torch.stack(
+    [pair[0] for sample in x_windowed for pair in sample]
+), torch.stack([pair[1] for sample in x_windowed for pair in sample])
 
-    return data
+source_train, target_train, source_test, target_test = (
+    source[:-num_test_samples],
+    target[:-num_test_samples],
+    source[-num_test_samples:],
+    target[-num_test_samples:],
+)
+
+train_dataset, test_dataset = TensorDataset(source_train, target_train), TensorDataset(
+    source_test, target_test
+)
+
+train_dataloader, test_dataloader = DataLoader(
+    train_dataset, batch_size=16, shuffle=True
+), DataLoader(test_dataset, batch_size=16, shuffle=True)
+
+encoder, decoder, projection = (
+    torch.nn.GRU(number_of_goals, 128, batch_first=True),
+    torch.nn.GRU(number_of_goals, 128, batch_first=True),
+    torch.nn.Linear(128, number_of_goals),
+)
+
+optimizer = torch.optim.Adam(
+    list(encoder.parameters())
+    + list(decoder.parameters())
+    + list(projection.parameters()),
+    lr=0.001,
+)
+
+
+def forward_data(train: bool = True) -> float:
+    dataloader = train_dataloader if train else test_dataloader
+    losses = []
+
+    for source, target in dataloader:
+        if train:
+            optimizer.zero_grad()
+        _, encoder_repr = encoder(
+            torch.nn.functional.one_hot(source, num_classes=number_of_goals).float()
+        )
+
+        decoder_input = torch.cat(
+            (
+                torch.zeros(source.shape[0], 1, number_of_goals),
+                torch.nn.functional.one_hot(
+                    target[:, :-1], num_classes=number_of_goals
+                ),
+            ),
+            dim=1,
+        )
+
+        decoder_hidden, _ = decoder(decoder_input, encoder_repr)
+        predictions = projection(decoder_hidden)
+        loss = torch.nn.functional.cross_entropy(predictions.permute(0, 2, 1), target)
+        if train:
+            loss.backward()
+            optimizer.step()
+
+        losses.append(loss.item())
+
+    return torch.tensor(losses).mean().item()
+
+
+for epoch_i in range(200):
+    train_loss, test_loss = forward_data(), forward_data(train=False)
+    print(
+        "epoch: {}, train loss: {:.2f}, test loss: {:.2f}".format(
+            epoch_i + 1, train_loss, test_loss
+        )
+    )
